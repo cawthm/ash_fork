@@ -7,38 +7,43 @@
 - Queries pull **one ticker** at a time, never the full grid in one shot.
 - Default date range per batch: **1 trading day**. Widen to 5 days only after confirming query completes in <30s.
 - After each ticker completes a phase, append results to `SUMMARY.md` and to a per-ticker results file (`results/{TICKER}_phase{N}.csv`) so progress is visible.
-- Ticker execution order: **SPY → QQQ → NVDA → AMZN → NXPI → LULU** (most liquid first, so early results are the most informative).
+- Ticker execution order: **SPY → QQQ → NVDA → AMZN** (most liquid first; NXPI dropped for insufficient options density, LULU dropped for no options data).
 - After SPY and QQQ complete Phase 1, **pause and review**: if both show r ≈ 0 and accuracy ≈ 50%, the signal may not exist and we should discuss before burning time on the remaining four.
 - If any query exceeds 30s, abort, narrow the date range or bucket size, and note the constraint.
 - When/if signal is confirmed and we move to model building (Phase 2+), we can widen date ranges aggressively since the feature matrix construction will be scripted and tested.
 
 ## Phase 0: Data Reconnaissance
 
-- [ ] **0.1** Connect to TimescaleDB and confirm access (use creds from `.env`)
-- [ ] **0.2** List all tables, inspect schemas for stock trades and options trades tables
-- [ ] **0.3** Identify key columns: timestamp, symbol, price, size, delta, gamma, IV, trade direction/side
-- [ ] **0.4** Check date range coverage per ticker: `SELECT ticker, MIN(time), MAX(time), COUNT(*) FROM stock_trades WHERE ticker IN ('SPY','QQQ','NVDA','AMZN','NXPI','LULU') GROUP BY ticker`
-- [ ] **0.5** Same for options_data (using `underlying_ticker`)
-- [ ] **0.6** Compute data density for each ticker: avg stock trades/sec and avg options trades/sec (use a single representative day)
-- [ ] **0.7** For each ticker, determine viable bucket sizes: a bucket size is viable if median options trades per bucket ≥ 3. Record the (ticker, bucket_size) pairs that pass.
-- [ ] **0.8** Check for nulls, outliers, and data gaps (e.g., missing Greeks, zero-delta rows, overnight records)
-- [ ] **0.9** Document schema, data profile, and viable (ticker, bucket_size) grid in `SUMMARY.md`
+- [x] **0.1** Connect to TimescaleDB and confirm access (use creds from `.env`)
+- [x] **0.2** List all tables, inspect schemas for stock trades and options trades tables
+- [x] **0.3** Identify key columns: timestamp, symbol, price, size, delta, gamma, IV, trade direction/side
+- [x] **0.4** Check date range coverage per ticker (stock_trades: used index-based LIMIT 1 queries; full COUNT(*) infeasible on 5.2B rows — used pg_stat approx)
+- [x] **0.5** Same for options_data — date range confirmed via physical page reads (2024-05-01 to 2025-05-23). Per-ticker density blocked by timestamp issue (see 0.11).
+- [x] **0.6** Compute data density for each ticker: stock trades/sec done (RTH, 2025-05-20). Options density now measurable with corrected timestamps. NVDA ~24/sec RTH. NXPI ~0.01/sec, LULU not in options_data.
+- [x] **0.7** Determine viable bucket sizes: SPY/QQQ/NVDA/AMZN all viable for 5s–300s buckets (sufficient density). NXPI/LULU dropped.
+- [x] **0.8** Check for nulls, outliers, and data gaps — stock trades clean (0 null prices/sizes, 0.04% null GKYZ); options samples clean (0 null deltas, <0.6% null IVs, all deltas ≤ |1|, reasonable lag_ms)
+- [x] **0.9** Document schema, data profile in `SUMMARY.md` — updated with critical timestamp finding.
+- [x] **0.10** (unplanned) Discovered and cleaned up: invalid options_data index, 36 stale queries from prior sessions. New composite index failed; `idx_options_time` now valid.
+- [x] **0.11** (unplanned) ~~**CRITICAL**: Discovered that options_data `time` column is batch processing time~~ **RESOLVED**: The `time` column is the correct trade timestamp but with a timezone bug. R's `dbWriteTable` sent UTC timestamps as bare strings; PostgreSQL (server tz=America/Chicago) misinterpreted them as local time, shifting +5hr (CDT) or +6hr (CST). Fix: `(time AT TIME ZONE 'America/Chicago') AT TIME ZONE 'UTC'`. Verified against raw Polygon CSVs to millisecond precision. R loader fixed with `SET timezone = 'UTC'` on connection.
+- [x] **0.12** (unplanned) Applied fix to all 983M rows via CREATE TABLE AS + swap. All other columns (underlying_price, lag_ms, Greeks, IV) were always correct.
+
+## ~~Phase 0.5: Options Timestamp Reconstruction~~ — SKIPPED
+
+> Phase 0.5 is no longer needed. The timestamp issue was a timezone bug in the R→PostgreSQL loading pipeline, not missing trade times. Fixed in-place. Timestamps are now correct to millisecond precision (original SIP timestamps from Polygon data).
 
 ## Phase 1: Unconditional Signal Analysis
 
-> Execute per-ticker in order: SPY → QQQ → NVDA → AMZN → NXPI → LULU.
+> Execute per-ticker in order: SPY → QQQ → NVDA → AMZN.
 > Each ticker: start with 1 trading day, widen only if queries are fast.
 > Write results to `results/{TICKER}_phase1.csv` and update `SUMMARY.md` after each ticker.
 
 - [ ] **1.1** Create `results/` directory
 - [ ] **1.2** **SPY**: For each viable bucket size, construct bucketed delta flow and forward returns for 1 day. Compute correlations and sign accuracy. Save to `results/SPY_phase1.csv`. Update `SUMMARY.md`.
 - [ ] **1.3** **QQQ**: Same as 1.2. Save to `results/QQQ_phase1.csv`. Update `SUMMARY.md`.
-- [ ] **1.4** **🔍 REVIEW GATE**: Inspect SPY and QQQ results. If both show |r| < 0.005 and sign accuracy < 50.2% across all bucket sizes, flag for human review before continuing. Otherwise proceed.
+- [ ] **1.4** **REVIEW GATE**: Inspect SPY and QQQ results. If both show |r| < 0.005 and sign accuracy < 50.2% across all bucket sizes, flag for human review before continuing. Otherwise proceed.
 - [ ] **1.5** **NVDA**: Same. Save to `results/NVDA_phase1.csv`. Update `SUMMARY.md`.
 - [ ] **1.6** **AMZN**: Same. Save to `results/AMZN_phase1.csv`. Update `SUMMARY.md`.
-- [ ] **1.7** **NXPI**: Same (may have fewer viable bucket sizes). Save to `results/NXPI_phase1.csv`. Update `SUMMARY.md`.
-- [ ] **1.8** **LULU**: Same. Save to `results/LULU_phase1.csv`. Update `SUMMARY.md`.
-- [ ] **1.9** Compile cross-ticker summary: which (ticker, bucket_size) pairs show signal, if any. Identify patterns (ETFs vs. singles, short vs. long buckets). Update `SUMMARY.md`.
+- [ ] **1.7** Compile cross-ticker summary: which (ticker, bucket_size) pairs show signal, if any. Identify patterns (ETFs vs. singles, short vs. long buckets). Update `SUMMARY.md`.
 
 ## Phase 1b: Secondary Features
 
@@ -96,7 +101,8 @@
 - **One ticker at a time, always.** Never query multiple tickers in a single SQL statement.
 - **Start with 1 trading day per ticker.** Only widen after confirming the query runs in <30s.
 - **Write results after every ticker**, not after every phase. `results/{TICKER}_phase{N}.csv` plus `SUMMARY.md` update.
-- Phases 0–1 are pure SQL queries via MCP or `db_utils.py` — no modeling code needed yet
+- Phase 0 is complete. Options timestamps are now correct (timezone bug fixed, ms-precision SIP times).
+- Phases 1–1b are pure SQL queries via MCP or `db_utils.py` — no modeling code needed yet.
 - Phase 1.5 builds the Python infrastructure. Validate end-to-end on one (ticker, bucket, single day) before running the grid.
 - Phases 2+ use the scripts from 1.5. Do not write one-off analysis code; extend the existing modules.
 - If a query takes >30s, abort and reduce scope (fewer rows, shorter date range, larger bucket)
